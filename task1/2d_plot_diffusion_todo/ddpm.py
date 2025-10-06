@@ -35,9 +35,7 @@ class BaseScheduler(nn.Module):
         if mode == "linear":
             betas = torch.linspace(beta_1, beta_T, steps=num_train_timesteps)
         elif mode == "quad":
-            betas = (
-                torch.linspace(beta_1**0.5, beta_T**0.5, num_train_timesteps) ** 2
-            )
+            betas = torch.linspace(beta_1**0.5, beta_T**0.5, num_train_timesteps) ** 2
         else:
             raise NotImplementedError(f"{mode} is not implemented.")
 
@@ -57,7 +55,7 @@ class DiffusionModule(nn.Module):
 
     def __init__(self, network: nn.Module, var_scheduler: BaseScheduler):
         super().__init__()
-        self.network = network ### predict noise
+        self.network = network  ### predict noise
         self.var_scheduler = var_scheduler
 
     @property
@@ -87,8 +85,7 @@ class DiffusionModule(nn.Module):
         # DO NOT change the code outside this part.
         # Compute xt.
         alphas_prod_t = extract(self.var_scheduler.alphas_cumprod, t, x0)
-        xt = x0
-
+        xt = x0 * torch.sqrt(alphas_prod_t) + noise * torch.sqrt(1 - alphas_prod_t)
         #######################
 
         return xt
@@ -112,20 +109,23 @@ class DiffusionModule(nn.Module):
             1 - extract(self.var_scheduler.alphas_cumprod, t, xt)
         ).sqrt()
 
-        beta_t      = extract(self.var_scheduler.betas,           t, xt)         # β_t
-        alpha_t     = extract(self.var_scheduler.alphas,          t, xt)         # α_t = 1 - β_t
-        alpha_bar_t = extract(self.var_scheduler.alphas_cumprod,  t, xt)         # \bar{α}_t
-        t_prev      = (t - 1).clamp(min=0)
-        alpha_bar_t_prev = extract(self.var_scheduler.alphas_cumprod, t_prev, xt) # \bar{α}_{t-1}
+        beta_t = extract(self.var_scheduler.betas, t, xt)  # β_t
+        alpha_t = extract(self.var_scheduler.alphas, t, xt)  # α_t = 1 - β_t
+        alpha_bar_t = extract(self.var_scheduler.alphas_cumprod, t, xt)  # \bar{α}_t
+        t_prev = (t - 1).clamp(min=0)
+        alpha_bar_t_prev = extract(
+            self.var_scheduler.alphas_cumprod, t_prev, xt
+        )  # \bar{α}_{t-1}
 
         # 1. predict noise
-        
+        predict_noise = self.network(xt, t)
         # 2. Posterior mean
-        
+        mean = (xt - eps_factor * predict_noise) / torch.sqrt(alpha_t)
         # 3. Posterior variance
-        
+        variance = (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * beta_t
         # 4. Reverse step
-        
+        x_t_prev = mean + torch.sqrt(variance) * torch.randn_like(xt)
+
         #######################
         return x_t_prev
 
@@ -144,7 +144,9 @@ class DiffusionModule(nn.Module):
         # sample x0 based on Algorithm 2 of DDPM paper.
         xt = torch.randn(shape).to(self.device)
         x0_pred = None
-        
+        for t in self.var_scheduler.timesteps:
+            xt = self.p_sample(xt, t.to(self.device))
+        x0_pred = xt
         ######################
         return x0_pred
 
@@ -171,7 +173,33 @@ class DiffusionModule(nn.Module):
         else:
             alpha_prod_t_prev = torch.ones_like(alpha_prod_t)
 
-        x_t_prev = xt
+        # 1. Predict noise using the model
+        predict_noise = self.network(xt, t)
+
+        # 2. Predict x0 from xt and predicted noise
+        # x0 = (xt - sqrt(1 - alpha_prod_t) * noise) / sqrt(alpha_prod_t)
+        predict_x0 = (xt - torch.sqrt(1 - alpha_prod_t) * predict_noise) / torch.sqrt(
+            alpha_prod_t
+        )
+
+        # 3. Compute the direction pointing to xt
+        # sigma_t = eta * sqrt((1 - alpha_prod_t_prev) / (1 - alpha_prod_t)) * sqrt(1 - alpha_prod_t / alpha_prod_t_prev)
+        sigma_t = (
+            eta
+            * torch.sqrt((1 - alpha_prod_t_prev) / (1 - alpha_prod_t))
+            * torch.sqrt(1 - alpha_prod_t / alpha_prod_t_prev)
+        )
+
+        # 4. Compute the direction pointing to xt (deterministic part)
+        direction = torch.sqrt(1 - alpha_prod_t_prev - sigma_t**2) * predict_noise
+
+        # 5. Compute x_t_prev
+        x_t_prev = torch.sqrt(alpha_prod_t_prev) * predict_x0 + direction
+
+        # 6. Add stochastic noise (if eta > 0)
+        if eta > 0:
+            noise = torch.randn_like(xt)
+            x_t_prev = x_t_prev + sigma_t * noise
 
         ######################
         return x_t_prev
@@ -202,9 +230,14 @@ class DiffusionModule(nn.Module):
         timesteps = torch.from_numpy(timesteps)
         prev_timesteps = timesteps - step_ratio
 
-        xt = torch.zeros(shape).to(self.device)
+        # Start from random Gaussian noise
+        xt = torch.randn(shape).to(self.device)
+
+        # Iteratively denoise
         for t, t_prev in zip(timesteps, prev_timesteps):
-            pass
+            t = t.to(self.device)
+            t_prev = t_prev.to(self.device)
+            xt = self.ddim_p_sample(xt, t, t_prev, eta)
 
         x0_pred = xt
 
@@ -224,7 +257,7 @@ class DiffusionModule(nn.Module):
         # DO NOT change the code outside this part.
         # compute noise matching loss.
         batch_size = x0.shape[0]
-        
+
         # 1) random choose timestep
         t = (
             torch.randint(0, self.var_scheduler.num_train_timesteps, size=(batch_size,))
@@ -232,12 +265,15 @@ class DiffusionModule(nn.Module):
             .long()
         )
         # 2) get GT noise, and use q_sample to get x_t
-        
-        # 3) predict noise 
-        
+        eps = torch.randn_like(x0)
+        xt = self.q_sample(x0, t, eps)
+
+        # 3) predict noise
+        eps_pred = self.network(xt, t)
+
         # 4) MSE loss (eps, eps_pred)
-        
-        loss = None
+
+        loss = F.mse_loss(eps, eps_pred)
 
         ######################
         return loss
