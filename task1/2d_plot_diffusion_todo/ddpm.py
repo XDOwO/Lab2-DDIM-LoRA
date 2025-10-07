@@ -192,12 +192,10 @@ class DiffusionModule(nn.Module):
         direction = torch.sqrt(1 - alpha_prod_t_prev - sigma_t**2) * predict_noise
 
         # 5. Compute x_t_prev
-        x_t_prev = torch.sqrt(alpha_prod_t_prev) * predict_x0 + direction
+        noise = torch.randn_like(xt)
+        x_t_prev = torch.sqrt(alpha_prod_t_prev) * predict_x0 + direction + sigma_t * noise
 
-        # 6. Add stochastic noise (if eta > 0)
-        if eta > 0:
-            noise = torch.randn_like(xt)
-            x_t_prev = x_t_prev + sigma_t * noise
+
 
         ######################
         return x_t_prev

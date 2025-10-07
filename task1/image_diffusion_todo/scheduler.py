@@ -354,25 +354,23 @@ class DDIMScheduler(BaseScheduler):
         t_prev = self.timesteps[t_index + 1] if t_index < len(self.timesteps) - 1 else torch.tensor(-1)
         t_prev = t_prev.to(x_t.device)
 
-        # 2. get alpha_bar_t and alpha_bar_t_prev
-        alpha_bar_t = self.alphas_cumprod[t]
-        alpha_bar_t_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else self.alphas_cumprod[0]
-
-        # 3. predict x0
-        pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * eps_theta) / torch.sqrt(alpha_bar_t)
-
-        # 4. compute sigma_t
-        sigma_t = self.eta * torch.sqrt(
-            (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev)
-        )
-
-        # 5. compute x_{t-1}
-        pred_dir = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps_theta
-        
-        if t_prev < 0:
-            sample_prev = pred_x0
+        alpha_prod_t = extract(self.alphas_cumprod, t, x_t)
+        if t_prev >= 0:
+            alpha_prod_t_prev = extract(self.alphas_cumprod, t_prev, x_t)
         else:
-            noise = torch.randn_like(x_t)
-            sample_prev = torch.sqrt(alpha_bar_t_prev) * pred_x0 + pred_dir + sigma_t * noise
+            alpha_prod_t_prev = torch.ones_like(alpha_prod_t)
+
+
+        predict_x0 = (x_t - torch.sqrt(1 - alpha_prod_t) * eps_theta) / torch.sqrt(alpha_prod_t)
+
+        sigma_t = self.eta \
+                * torch.sqrt((1 - alpha_prod_t_prev) / (1 - alpha_prod_t)) \
+                * torch.sqrt(1 - alpha_prod_t / alpha_prod_t_prev)
+
+        direction = torch.sqrt(1 - alpha_prod_t_prev - sigma_t**2) * eps_theta
+
+        sample_prev = torch.sqrt(alpha_prod_t_prev) * predict_x0 + direction + sigma_t * torch.randn_like(x_t)
+
+
         #######################
         return sample_prev
