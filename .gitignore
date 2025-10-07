@@ -6,6 +6,7 @@ results/
 outputs
 samples/
 .DS_Store
+*.png
 
 # Solutions
 2d_plot_diffusion
