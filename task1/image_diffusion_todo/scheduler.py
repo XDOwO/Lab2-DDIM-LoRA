@@ -9,7 +9,7 @@ def extract(input, t: torch.Tensor, x: torch.Tensor):
         t = t.unsqueeze(0)
     shape = x.shape
     t = t.long().to(input.device)
-    out = torch.gather(input, 0, t)
+    out = torch.gather(input, 0, t).to(x.device)
     reshape = [t.shape[0]] + [1] * (len(shape) - 1)
     return out.reshape(*reshape)
 
@@ -40,11 +40,17 @@ class BaseScheduler(nn.Module):
             # 2. Convert alphā_t into betas using:
             #       beta_t = 1 - alphā_t / alphā_{t-1}
             # 3. Return betas as a tensor of shape [num_train_timesteps].
-            raise NotImplementedError("TODO: Implement cosine beta schedule here!")
-               
+            s = 0.008
+            timesteps = num_train_timesteps
+            steps = timesteps + 1
+            t = torch.linspace(0, timesteps, steps, dtype = torch.float32) / timesteps
+            alphas_cumprod = torch.cos((t + s) / (1 + s) * torch.pi * 0.5) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            betas = torch.clip(betas, 0, 0.999)
+            
         else:
             raise NotImplementedError(f"{mode} is not implemented.")
-
         alphas = 1 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
@@ -124,6 +130,61 @@ class DDPMScheduler(BaseScheduler):
         # 4. Add Gaussian noise scaled by √(\tilde{β}_t) unless t == 0.
         # 5. Return the final sample at t-1.
         sample_prev = None
+
+        # beta_t = extract(self.betas, t, x_t)
+        # alpha_t = extract(self.alphas, t, x_t)
+        # alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
+        # t_prev = (t - 1).clamp(min=0)
+        # alpha_bar_t_prev = extract(
+        #     self.alphas_cumprod, t_prev, x_t
+        # )
+        # mu_theta = 1 / torch.sqrt(alpha_t) * (x_t - (beta_t / torch.sqrt(1 - alpha_bar_t)) * eps_theta)
+        # tilde_beta_t = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * beta_t
+        # sample_prev = mu_theta + (torch.sqrt(tilde_beta_t)) * torch.randn_like(x_t) if t > 0 else mu_theta
+        
+        # The original code for step_predict_noise. Because cosine's scheduler's time is very different from linear and quad, it will make the sampling very unstable.
+        # Especially this term (β_t / √(1-ᾱ_t)), which is quite huge when t is large.
+        # Ex. For timestep t = 999, Cosine Scheduler's term = 0.9990000128746033
+        # While Linear Scheduler's one = 0.020000403746962547
+        # And Quad Scheduler's one = 0.020007340237498283
+        # This make mu_theta from cosine scheduler very unstable, because the model need to predict noise with very high precision.
+        # Even with a solid model, t = 999 almost decide the whole sampling result, which is not very desirable.
+
+        # The following implementation is more stable for cosine scheduler.
+
+        # 1. Predict x_0 from the predicted noise (eps_theta).
+        #    x_0_pred = (1/sqrt(ᾱ_t)) * (x_t - sqrt(1-ᾱ_t) * ε̂_θ)
+        alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
+        
+        x0_pred = (
+            (1.0 / torch.sqrt(alpha_bar_t)) * (x_t -  torch.sqrt(1 - alpha_bar_t) * eps_theta)
+        )
+
+        # 2. Clip the predicted x_0 to the valid range [-1, 1].
+        x0_pred.clamp_(-1.0, 1.0)
+
+        # 3. Compute the posterior mean using the clipped x_0.
+        #    This formula is derived from q(x_{t-1} | x_t, x_0).
+        t_prev = (t - 1).clamp(min=0)
+        alpha_bar_t_prev = extract(self.alphas_cumprod, t_prev, x_t)
+        beta_t = extract(self.betas, t, x_t)
+        
+        # Coefficients for the posterior mean q(x_{t-1} | x_t, x_0)
+        # Coef1 = (sqrt(ᾱ_{t-1}) * β_t) / (1 - ᾱ_t)
+        # Coef2 = (sqrt(α_t) * (1 - ᾱ_{t-1})) / (1 - ᾱ_t)
+        q_posterior_mean_coef1 = (torch.sqrt(alpha_bar_t_prev) * beta_t) / (1.0 - alpha_bar_t)
+        q_posterior_mean_coef2 = (torch.sqrt(extract(self.alphas, t, x_t)) * (1.0 - alpha_bar_t_prev)) / (1.0 - alpha_bar_t)
+        
+        model_mean = q_posterior_mean_coef1 * x0_pred + q_posterior_mean_coef2 * x_t
+
+        # 4. Compute the posterior variance.
+        tilde_beta_t = ((1.0 - alpha_bar_t_prev) / (1.0 - alpha_bar_t)) * beta_t
+        
+        # 5. Add Gaussian noise scaled by the posterior standard deviation.
+        noise = torch.randn_like(x_t) if t > 0 else 0.0
+        log_tilde_beta_t = torch.log(tilde_beta_t.clamp(min=1e-20))
+        sample_prev = model_mean + (0.5 * log_tilde_beta_t).exp() * noise
+        
         #######################
         return sample_prev
 
@@ -140,8 +201,20 @@ class DDPMScheduler(BaseScheduler):
             sample_prev: denoised image sample at timestep t-1
         """
         ######## TODO ########
-
         sample_prev = None
+        beta_t = extract(self.betas, t, x_t)
+        alpha_t = extract(self.alphas, t, x_t)
+        alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
+        t_prev = (t - 1).clamp(min=0)
+        alpha_bar_t_prev = extract(
+            self.alphas_cumprod, t_prev, x_t
+        )
+        x0_pred.clamp_(-1.0, 1.0)
+        mean = torch.sqrt(alpha_t)*(1 - alpha_bar_t_prev)/(1 - alpha_bar_t) * x_t + torch.sqrt(alpha_bar_t_prev)*beta_t/(1-alpha_bar_t) * x0_pred
+        
+        tilde_beta_t = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * beta_t
+        log_tilde_beta_t = torch.log(tilde_beta_t.clamp(min=1e-20))
+        sample_prev = mean + (0.5 * log_tilde_beta_t).exp() * torch.randn_like(x_t) if t > 0 else mean
         #######################
         return sample_prev
 
@@ -158,8 +231,25 @@ class DDPMScheduler(BaseScheduler):
             sample_prev: denoised image sample at timestep t-1
         """
         ######## TODO ########
-
         sample_prev = None
+        beta_t = extract(self.betas, t, x_t)
+        alpha_t = extract(self.alphas, t, x_t)
+        alpha_bar_t = extract(self.alphas_cumprod, t, x_t)
+        t_prev = (t - 1).clamp(min=0)
+        alpha_bar_t_prev = extract(
+            self.alphas_cumprod, t_prev, x_t
+        )
+        # tilde_beta_t = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * beta_t
+        # sample_prev = mean_theta + (torch.sqrt(tilde_beta_t)) * torch.randn_like(x_t) if t > 0 else mean_theta
+
+        x0_pred = ((1 - alpha_bar_t) * mean_theta - torch.sqrt(alpha_t) * (1 - alpha_bar_t_prev) * x_t) / (torch.sqrt(alpha_bar_t_prev) * beta_t)
+        x0_pred.clamp_(-1.0, 1.0)
+        q_posterior_mean_coef1 = (torch.sqrt(alpha_bar_t_prev) * beta_t) / (1.0 - alpha_bar_t)
+        q_posterior_mean_coef2 = (torch.sqrt(extract(self.alphas, t, x_t)) * (1.0 - alpha_bar_t_prev)) / (1.0 - alpha_bar_t)
+        
+        new_mean = q_posterior_mean_coef1 * x0_pred + q_posterior_mean_coef2 * x_t
+        tilde_beta_t = ((1 - alpha_bar_t_prev) / (1 - alpha_bar_t)) * beta_t
+        sample_prev = new_mean + (torch.sqrt(tilde_beta_t)) * torch.randn_like(x_t) if t > 0 else new_mean
         #######################
         return sample_prev
 
@@ -195,9 +285,14 @@ class DDPMScheduler(BaseScheduler):
         # DO NOT change the code outside this part.
         # Assignment 1. Implement the DDPM forward step.
         x_t = None
+        eps = eps.to(x_0.device)
+        alphas_prod_t = extract(self.alphas_cumprod, t, x_0)
+        x_t = x_0 * torch.sqrt(alphas_prod_t) + eps * torch.sqrt(1.0 - alphas_prod_t)
         #######################
 
         return x_t, eps
+
+
 
 class DDIMScheduler(BaseScheduler):
     def __init__(
@@ -227,7 +322,11 @@ class DDIMScheduler(BaseScheduler):
         #   - Store the step ratio in `self._ddim_step_ratio` for later use when computing previous t.
         #   - Compute a `step_ratio` that maps inference steps to training steps.
         # DO NOT change the code outside this part.
-        raise NotImplementedError("TODO")
+        self.num_inference_timesteps = num_inference_timesteps
+        self._ddim_step_ratio = self.num_train_timesteps / self.num_inference_timesteps
+        timesteps = (torch.arange(0, num_inference_timesteps) * self._ddim_step_ratio).round()
+        timesteps = torch.flip(timesteps,dims=(0,))
+        self.timesteps = timesteps.long()
         #######################
 
     def _get_teeth(self, consts: torch.Tensor, t: torch.Tensor):
@@ -250,6 +349,30 @@ class DDIMScheduler(BaseScheduler):
         ######## TODO ########
         # DO NOT change the code outside this part.
         assert predictor == "noise", "In assignment 2, we only implement DDIM with noise predictor."
-        sample_prev = None
+        # 1. get previous step value
+        t_index = (self.timesteps == t).nonzero(as_tuple=True)[0]
+        t_prev = self.timesteps[t_index + 1] if t_index < len(self.timesteps) - 1 else torch.tensor(-1)
+        t_prev = t_prev.to(x_t.device)
+
+        # 2. get alpha_bar_t and alpha_bar_t_prev
+        alpha_bar_t = self.alphas_cumprod[t]
+        alpha_bar_t_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else self.alphas_cumprod[0]
+
+        # 3. predict x0
+        pred_x0 = (x_t - torch.sqrt(1 - alpha_bar_t) * eps_theta) / torch.sqrt(alpha_bar_t)
+
+        # 4. compute sigma_t
+        sigma_t = self.eta * torch.sqrt(
+            (1 - alpha_bar_t_prev) / (1 - alpha_bar_t) * (1 - alpha_bar_t / alpha_bar_t_prev)
+        )
+
+        # 5. compute x_{t-1}
+        pred_dir = torch.sqrt(1 - alpha_bar_t_prev - sigma_t**2) * eps_theta
+        
+        if t_prev < 0:
+            sample_prev = pred_x0
+        else:
+            noise = torch.randn_like(x_t)
+            sample_prev = torch.sqrt(alpha_bar_t_prev) * pred_x0 + pred_dir + sigma_t * noise
         #######################
         return sample_prev

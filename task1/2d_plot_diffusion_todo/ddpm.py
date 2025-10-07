@@ -177,13 +177,11 @@ class DiffusionModule(nn.Module):
         predict_noise = self.network(xt, t)
 
         # 2. Predict x0 from xt and predicted noise
-        # x0 = (xt - sqrt(1 - alpha_prod_t) * noise) / sqrt(alpha_prod_t)
         predict_x0 = (xt - torch.sqrt(1 - alpha_prod_t) * predict_noise) / torch.sqrt(
             alpha_prod_t
         )
 
         # 3. Compute the direction pointing to xt
-        # sigma_t = eta * sqrt((1 - alpha_prod_t_prev) / (1 - alpha_prod_t)) * sqrt(1 - alpha_prod_t / alpha_prod_t_prev)
         sigma_t = (
             eta
             * torch.sqrt((1 - alpha_prod_t_prev) / (1 - alpha_prod_t))
@@ -230,7 +228,6 @@ class DiffusionModule(nn.Module):
         timesteps = torch.from_numpy(timesteps)
         prev_timesteps = timesteps - step_ratio
 
-        # Start from random Gaussian noise
         xt = torch.randn(shape).to(self.device)
 
         # Iteratively denoise
