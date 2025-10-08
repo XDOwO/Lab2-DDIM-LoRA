@@ -5,7 +5,7 @@ import os
 steps_list = [10, 20, 50, 100, 1000]
 eta_list = [0.0, 0.2, 0.5, 1.0]
 ckpt_path = "./ln.ckpt"
-gpu = "4"
+gpu = "0"
 eval_data_dir = "data/afhq/eval/"
 
 results = []
