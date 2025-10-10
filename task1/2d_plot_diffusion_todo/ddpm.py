@@ -181,19 +181,19 @@ class DiffusionModule(nn.Module):
             alpha_prod_t
         )
 
-        # 3. Compute the direction pointing to xt
+        # 3. Compute sigma_t
         sigma_t = (
             eta
             * torch.sqrt((1 - alpha_prod_t_prev) / (1 - alpha_prod_t))
             * torch.sqrt(1 - alpha_prod_t / alpha_prod_t_prev)
         )
 
-        # 4. Compute the direction pointing to xt (deterministic part)
-        direction = torch.sqrt(1 - alpha_prod_t_prev - sigma_t**2) * predict_noise
+        # 4. Compute mu_tilde
+        mu_tilde = torch.sqrt(alpha_prod_t_prev) * predict_x0 + torch.sqrt(1 - alpha_prod_t_prev - sigma_t**2) * predict_noise
 
         # 5. Compute x_t_prev
         noise = torch.randn_like(xt)
-        x_t_prev = torch.sqrt(alpha_prod_t_prev) * predict_x0 + direction + sigma_t * noise
+        x_t_prev = mu_tilde + sigma_t * noise
 
 
 

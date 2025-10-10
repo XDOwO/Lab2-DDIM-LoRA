@@ -367,9 +367,9 @@ class DDIMScheduler(BaseScheduler):
                 * torch.sqrt((1 - alpha_prod_t_prev) / (1 - alpha_prod_t)) \
                 * torch.sqrt(1 - alpha_prod_t / alpha_prod_t_prev)
 
-        direction = torch.sqrt(1 - alpha_prod_t_prev - sigma_t**2) * eps_theta
+        mu_tilde = torch.sqrt(alpha_prod_t_prev) * predict_x0 + torch.sqrt(1 - alpha_prod_t_prev - sigma_t**2) * eps_theta
 
-        sample_prev = torch.sqrt(alpha_prod_t_prev) * predict_x0 + direction + sigma_t * torch.randn_like(x_t)
+        sample_prev =  mu_tilde + sigma_t * torch.randn_like(x_t)
 
 
         #######################
